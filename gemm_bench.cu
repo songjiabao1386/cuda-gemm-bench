@@ -7,24 +7,24 @@
 
 using namespace nvcuda::wmma;
 
-#define CHECK_CUDA(call)                                                      \
-    do {                                                                      \
-        cudaError_t err = call;                                               \
-        if (err != cudaSuccess) {                                             \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n",                      \
-                    __FILE__, __LINE__, cudaGetErrorString(err));             \
-            exit(EXIT_FAILURE);                                               \
-        }                                                                     \
+#define CHECK_CUDA(call)                                                    \
+    do {                                                                    \
+        cudaError_t err = call;                                             \
+        if (err != cudaSuccess) {                                           \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                    \
+                    __FILE__, __LINE__, cudaGetErrorString(err));           \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
     } while (0)
 
-#define CHECK_CUBLAS(call)                                                    \
-    do {                                                                      \
-        cublasStatus_t status = call;                                         \
-        if (status != CUBLAS_STATUS_SUCCESS) {                                \
-            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                   \
-                    __FILE__, __LINE__, status);                              \
-            exit(EXIT_FAILURE);                                               \
-        }                                                                     \
+#define CHECK_CUBLAS(call)                                                  \
+    do {                                                                    \
+        cublasStatus_t status = call;                                       \
+        if (status != CUBLAS_STATUS_SUCCESS) {                              \
+            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                  \
+                    __FILE__, __LINE__, status);                            \
+            exit(EXIT_FAILURE);                                             \
+        }                                                                   \
     } while (0)
 
 // ==================== Naive (FP32) ====================
@@ -69,8 +69,8 @@ __global__ void gemm_tiled(const float *A, const float *B, float *C,
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#define BLOCK_ROWS 128
-#define BLOCK_COLS 128
+#define BLOCK_ROWS 64
+#define BLOCK_COLS 64
 #define WARPS_PER_BLOCK ((BLOCK_ROWS / WMMA_M) * (BLOCK_COLS / WMMA_N))
 
 __global__ void gemm_wmma(const half *A, const half *B, float *C,
@@ -81,6 +81,8 @@ __global__ void gemm_wmma(const half *A, const half *B, float *C,
 
     int rowBase = blockIdx.y * BLOCK_ROWS + warpRow * WMMA_M;
     int colBase = blockIdx.x * BLOCK_COLS + warpCol * WMMA_N;
+
+    if (rowBase >= M || colBase >= N) return;
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag;
     fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, col_major> b_frag;
@@ -95,7 +97,11 @@ __global__ void gemm_wmma(const half *A, const half *B, float *C,
         mma_sync(c_frag, a_frag, b_frag, c_frag);
     }
 
-    store_matrix_sync(C + rowBase * N + colBase, c_frag, N, mem_row_major);
+    int globalRow = rowBase;
+    int globalCol = colBase;
+    if (globalRow + WMMA_M <= M && globalCol + WMMA_N <= N) {
+        store_matrix_sync(C + globalRow * N + globalCol, c_frag, N, mem_row_major);
+    }
 }
 
 // ==================== Benchmark ====================
@@ -114,10 +120,9 @@ int main() {
     float *h_C3 = (float *)malloc(bytes_Ch);
     float *h_C4 = (float *)malloc(bytes_Ch);
 
-    for (int i = 0; i < M * K; ++i) h_A[i] = (float)rand() / RAND_MAX;
-    for (int i = 0; i < K * N; ++i) h_B[i] = (float)rand() / RAND_MAX;
+    for (int i = 0; i < M * K; ++i) h_A[i] = (float)rand() / RAND_MAX * 0.1f;
+    for (int i = 0; i < K * N; ++i) h_B[i] = (float)rand() / RAND_MAX * 0.1f;
 
-    // FP32 buffers
     float *d_A, *d_B, *d_C;
     CHECK_CUDA(cudaMalloc(&d_A, bytes_A));
     CHECK_CUDA(cudaMalloc(&d_B, bytes_B));
@@ -125,7 +130,6 @@ int main() {
     CHECK_CUDA(cudaMemcpy(d_A, h_A, bytes_A, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_B, h_B, bytes_B, cudaMemcpyHostToDevice));
 
-    // FP16 buffers for WMMA
     half *d_Ah, *d_Bh;
     CHECK_CUDA(cudaMalloc(&d_Ah, bytes_Ah));
     CHECK_CUDA(cudaMalloc(&d_Bh, bytes_Bh));
@@ -143,12 +147,14 @@ int main() {
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
-    // naive
+    // 1. naive
     {
         dim3 block(32, 32);
         dim3 grid((N + 31) / 32, (M + 31) / 32);
         gemm_naive<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+        CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
+
         CHECK_CUDA(cudaEventRecord(start));
         for (int i = 0; i < 20; ++i)
             gemm_naive<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
@@ -161,12 +167,14 @@ int main() {
         printf("[naive]   %.3f ms  |  %.2f GFLOPS\n", ms, 2.0*M*N*K/1e9/(ms/1000.0));
     }
 
-    // tiled
+    // 2. tiled
     {
         dim3 block(TILE, TILE);
         dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
         gemm_tiled<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+        CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
+
         CHECK_CUDA(cudaEventRecord(start));
         for (int i = 0; i < 20; ++i)
             gemm_tiled<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
@@ -179,13 +187,15 @@ int main() {
         printf("[tiled]   %.3f ms  |  %.2f GFLOPS\n", ms, 2.0*M*N*K/1e9/(ms/1000.0));
     }
 
-    // wmma
+    // 3. wmma
     {
         dim3 block(WARPS_PER_BLOCK * 32);
         dim3 grid((N + BLOCK_COLS - 1) / BLOCK_COLS,
                   (M + BLOCK_ROWS - 1) / BLOCK_ROWS);
         gemm_wmma<<<grid, block>>>(d_Ah, d_Bh, d_C, M, N, K);
+        CHECK_CUDA(cudaGetLastError());
         CHECK_CUDA(cudaDeviceSynchronize());
+
         CHECK_CUDA(cudaEventRecord(start));
         for (int i = 0; i < 20; ++i)
             gemm_wmma<<<grid, block>>>(d_Ah, d_Bh, d_C, M, N, K);
@@ -198,7 +208,7 @@ int main() {
         printf("[wmma]    %.3f ms  |  %.2f GFLOPS\n", ms, 2.0*M*N*K/1e9/(ms/1000.0));
     }
 
-    // cuBLAS
+    // 4. cuBLAS
     {
         cublasHandle_t handle;
         CHECK_CUBLAS(cublasCreate(&handle));
@@ -206,6 +216,7 @@ int main() {
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                  N, M, K, &alpha, d_B, N, d_A, K, &beta, d_C, N));
         CHECK_CUDA(cudaDeviceSynchronize());
+
         CHECK_CUDA(cudaEventRecord(start));
         for (int i = 0; i < 20; ++i)
             CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,

@@ -1,20 +1,12 @@
-# CUDA GEMM Benchmark
+# ⚡️ CUDA GEMM Benchmark ⚡️
 
-对比不同 CUDA 矩阵乘法实现的性能，包括 naive、shared memory tiled、WMMA (Tensor Core) 和 cuBLAS。
+对比不同 CUDA 矩阵乘法实现的性能。
 
-## 编译运行
+## 🚀 性能测试结果 (Benchmark)
 
-nvcc -O3 -std=c++11 -arch=sm_75 gemm_bench.cu -lcublas -o gemm_bench && ./gemm_bench
-
-## 实现说明
-
-| Kernel | 精度 | 说明 |
-|---|---|---|
-| naive | FP32 | 全局内存直接读写 |
-| tiled | FP32 | 32x32 shared memory 分块 |
-| wmma | FP16 in / FP32 acc | WMMA API |
-| cuBLAS | FP32 | cublasSgemm 参考基线 |
-
-## License
-
-MIT
+| 实施方案 | 运行时间 (ms) | 算力 (GFLOPS) |
+| :--- | :---: | :---: |
+| [naive] | 4.063 | 528.52 |
+| [tiled] | 2.586 | 830.54 |
+| [wmma] | 0.690 | 3114.40 |
+| [cublas] | 0.377 | 5692.69 |
